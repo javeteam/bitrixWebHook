@@ -25,8 +25,8 @@ public class MainController {
 
     @RequestMapping(value = {"/api/kjsMGkjiZTOZQqD"}, method = RequestMethod.POST, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public String sendBitrixNotification(@RequestBody ExpandiLead lead){
-        this.bitrixService.sendNotification(lead);
+    public String createBitrixTask(@RequestBody ExpandiLead lead){
+        this.bitrixService.createTask(lead);
         return "{\"Status\":\"Success\"}";
     }
 

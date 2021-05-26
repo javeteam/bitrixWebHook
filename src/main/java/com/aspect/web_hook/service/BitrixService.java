@@ -1,11 +1,14 @@
 package com.aspect.web_hook.service;
 
 import com.aspect.web_hook.entity.ExpandiLead;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.stereotype.Service;
 
 import javax.net.ssl.HttpsURLConnection;
@@ -17,6 +20,8 @@ import java.io.InputStreamReader;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -33,25 +38,70 @@ public class BitrixService {
         this.logger = LoggerFactory.getLogger(BitrixService.class);
     }
 
-    public void sendNotification(ExpandiLead lead){
+    public void createTask(ExpandiLead lead){
         Map<String, String> parameters = new HashMap<>();
-        String message = "Lead " + lead.getContact().getFirstName() + " " + lead.getContact().getLastName() + " sent you a message: " + lead.getMessenger().getMessage();
-        parameters.put("MESSAGE", message);
-        parameters.put("DIALOG_ID", String.valueOf(bitrixUserId));
-        String url_str = bitrixRESTUrl + "im.message.add.json" + getParamsString(parameters);
+
+        parameters.put("fields[TITLE]", "Reply to lead " + lead.getContact().getFirstName() + " " + lead.getContact().getLastName());
+        parameters.put("fields[DESCRIPTION]", lead.getMessenger().getMessage());
+        parameters.put("fields[RESPONSIBLE_ID]", String.valueOf(bitrixUserId));
+        parameters.put("fields[DEADLINE]", getFormattedTaskDeadline());
+        parameters.put("fields[PRIORITY]", "2");
+
+        long expandiLeadId = lead.getContact().getId();
+        if(expandiLeadId > 0){
+            String url_str = bitrixRESTUrl + "crm.lead.list.json?select[ID]&filter[UF_CRM_1622010050910]=" + expandiLeadId;
+            String result = execute(url_str);
+            if(result != null){
+                try{
+                    final ObjectNode node = new ObjectMapper().readValue(result, ObjectNode.class);
+                    if(node.has("result")){
+                        final JsonNode resultArray = node.get("result");
+                        if(resultArray.isArray()){
+                            for(int i = 0; i < resultArray.size(); i ++){
+                                final JsonNode crmItem = resultArray.get(i);
+                                if(crmItem.has("ID")){
+                                    parameters.put("fields[UF_CRM_TASK][" + i + "]", crmItem.get("ID").textValue());
+                                }
+                            }
+                        }
+                    }
+                } catch (IOException ex){
+                    logger.info("Failed to find lead during task creation ",  ex);
+                }
+            }
+        }
+        String url_str = bitrixRESTUrl + "tasks.task.add.json" + getParamsString(parameters);
         execute(url_str);
     }
 
     public void addLead(ExpandiLead lead){
-        Map<String, String> parameters = processLeadParameters(lead);
-        String url_str = bitrixRESTUrl + "crm.lead.add.json" + getParamsString(parameters);
-        execute(url_str);
+        long expandiLeadId = lead.getContact().getId();
+        if(expandiLeadId > 0){
+            String url_str = bitrixRESTUrl + "crm.lead.list.json?select[ID]&filter[UF_CRM_1622010050910]=" + expandiLeadId;
+            String result = execute(url_str);
+            if(result != null){
+                try{
+                    final ObjectNode node = new ObjectMapper().readValue(result, ObjectNode.class);
+                    if(node.has("total")){
+                        if(node.get("total").intValue() == 0){
+                            Map<String, String> parameters = processLeadParameters(lead);
+                            url_str = bitrixRESTUrl + "crm.lead.add.json" + getParamsString(parameters);
+                            execute(url_str);
+                        } else logger.info("Lead with id " + expandiLeadId + " already exist");
+                    }
+                } catch (IOException ex){
+                    logger.error("Duplicates check failed ",  ex);
+                }
+
+            } else logger.error("Duplicates check for lead with id " + expandiLeadId + " failed");
+        } else logger.info("Lead id (" + expandiLeadId + ") is wrong. Skipping...");
     }
 
-    private void execute(String url_str){
+    private String execute(String url_str){
+        HttpsURLConnection connection = null;
         try{
             URL url = new URL(url_str);
-            HttpsURLConnection connection = (HttpsURLConnection) url.openConnection();
+            connection = (HttpsURLConnection) url.openConnection();
             SSLSocketFactory socketFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
             connection.setSSLSocketFactory(socketFactory);
             connection.setRequestMethod("POST");
@@ -60,19 +110,27 @@ public class BitrixService {
             connection.setDoOutput(true);
             connection.setRequestProperty("Content-Type", "application/json");
 
-            if(connection.getResponseCode() != 200){
+            if(connection.getResponseCode() == 200){
+                return getJsonResponse(connection.getInputStream());
+            } else {
                 String response = getJsonResponse(connection.getErrorStream());
                 BitrixJsonError error = new ObjectMapper().readValue(response, BitrixJsonError.class);
                 if(error != null) throw new IOException(error.error_description);
             }
-
         } catch (IOException ex){
             logger.error("Command execution failed",  ex);
+        } finally {
+            if(connection != null) connection.disconnect();
         }
+        return null;
     }
 
     private Map<String, String> processLeadParameters(ExpandiLead lead){
         Map<String, String> leadParams = new HashMap<>();
+
+        // expandi lead ID to check for duplicates
+        leadParams.put("FIELDS[UF_CRM_1622010050910]", String.valueOf(lead.getContact().getId()));
+
         String firstName = lead.getMessenger().getPlaceholders().getFirstName();
         if(firstName == null || firstName.isBlank()) firstName = lead.getContact().getFirstName();
         leadParams.put("FIELDS[NAME]", firstName);
@@ -120,8 +178,6 @@ public class BitrixService {
         return leadParams;
     }
 
-
-
     private static String getParamsString(Map<String, String> params) {
         StringBuilder result = new StringBuilder();
         result.append(("?"));
@@ -136,15 +192,37 @@ public class BitrixService {
         return result.toString();
     }
 
-    private String getJsonResponse(InputStream errorStream) throws IOException{
+    private String getJsonResponse(InputStream inputStream) throws IOException{
         StringBuilder res = new StringBuilder();
-        InputStreamReader in = new InputStreamReader(errorStream);
+        InputStreamReader in = new InputStreamReader(inputStream);
         BufferedReader br = new BufferedReader(in);
         String output;
         while ((output = br.readLine()) != null) {
             res.append(output);
         }
         return res.toString();
+    }
+
+    private String getFormattedTaskDeadline(){
+        LocalDateTime deadline = LocalDateTime.now();
+        int dayOfWeekValue = deadline.getDayOfWeek().getValue();
+        switch (dayOfWeekValue){
+            case 1:
+            case 2:
+                deadline = deadline.plusDays(3);
+                break;
+            case 3:
+                deadline = deadline.plusDays(2).withHour(18).withMinute(0);
+                break;
+            case 4:
+            case 5:
+                deadline = deadline.plusDays(5);
+                break;
+            case 6:
+            case 7:
+                deadline = deadline.plusDays(3 + 7 - dayOfWeekValue).withHour(18).withMinute(0);
+        }
+        return deadline.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
     }
 
     private static class BitrixJsonError{
